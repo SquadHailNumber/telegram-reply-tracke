@@ -53,6 +53,21 @@ def parse_name_and_time(value: str):
     return name, time_value
 
 
+def parse_batch_lines(value: str):
+    """Разбирает список строк вида «Фамилия 07:00»."""
+    parsed = []
+    invalid = []
+    for line_number, line in enumerate((value or "").splitlines(), start=1):
+        if not line.strip():
+            continue
+        item = parse_name_and_time(line)
+        if item:
+            parsed.append(item)
+        else:
+            invalid.append((line_number, line.strip()))
+    return parsed, invalid
+
+
 def worked_duration(start_time: str, finished_at: str):
     end_dt = datetime.fromisoformat(finished_at)
     start_clock = datetime.strptime(start_time, "%H:%M").time()
@@ -152,9 +167,10 @@ async def render_list(user_id: int, mode: str):
         else:
             status = "⏳"
             detail = f"с {row['time']}"
-        text += f"{status} <b>{name}</b> — {detail}\n"
+        answer_mark = "✅" if row["answered"] else "⬜"
+        text += f"{status} <b>{name}</b> — {detail} · Ответил: {answer_mark}\n"
         buttons.append([InlineKeyboardButton(
-            text=f"{status} {row['name']} · {detail}",
+            text=f"{status} {answer_mark} {row['name']} · {detail}",
             callback_data=f"person:{row['id']}"
         )])
     buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")])
@@ -177,8 +193,7 @@ def person_keyboard(person):
         if person["finished_at"] else
         InlineKeyboardButton(text="🏁 Закончил работу", callback_data=f"finish:{person_id}")
     )
-    status = "Ответил ✅" if person["answered"] else "Не ответил ⬜"
-    toggle_text = "Снять отметку ответа" if person["answered"] else "Отметить: ответил"
+    toggle_text = "✅ Ответил — снять отметку" if person["answered"] else "⬜ Отметить: ответил"
     return InlineKeyboardMarkup(inline_keyboard=[
         [finish_button],
         [InlineKeyboardButton(text=toggle_text, callback_data=f"toggle:{person_id}")],
@@ -190,7 +205,8 @@ def person_keyboard(person):
 
 
 def person_text(person):
-    text = f"<b>{html.escape(person['name'])}</b>\nНачало работы: {person['time']}\n"
+    answer_status = "✅ Да" if person["answered"] else "⬜ Нет"
+    text = f"<b>{html.escape(person['name'])}</b>\nНачало работы: {person['time']}\nОтветил: {answer_status}\n"
     if person["finished_at"]:
         end_dt = datetime.fromisoformat(person["finished_at"])
         duration = duration_text(worked_duration(person["time"], person["finished_at"]))
@@ -226,7 +242,9 @@ async def start(message: Message, state: FSMContext):
 async def help_cmd(message: Message):
     await message.answer(
         "Команды:\n/start — главное меню\n/list — все записи\n/pending — кто ещё работает\n\n"
-        "Добавление одной строкой: Иванов 07:00"
+        "Добавление одного человека: Иванов 07:00\n"
+        "Добавление нескольких: каждый человек с новой строки, например:\n"
+        "Григорьев 07:00\nАллагуров 07:00\nКириллов 08:00"
     )
 
 
@@ -261,6 +279,31 @@ async def add_cb(call: CallbackQuery, state: FSMContext):
 @dp.message(AddPerson.name)
 async def add_name(message: Message, state: FSMContext):
     value = (message.text or "").strip()
+    if not value:
+        await message.answer("Напиши фамилию и время, например: Иванов 07:00")
+        return
+
+    # Несколько строк — добавляем все корректные записи за один раз.
+    if "\n" in value:
+        parsed_rows, invalid_rows = parse_batch_lines(value)
+        if not parsed_rows:
+            await message.answer(
+                "Не нашёл корректных строк. Используй формат:\n"
+                "Григорьев 07:00\nАллагуров 07:00\nКириллов 08:00"
+            )
+            return
+        for name, time_value in parsed_rows:
+            await insert_person(message.from_user.id, name, time_value)
+        await state.clear()
+        result = ["✅ <b>Добавлены записи:</b>"]
+        result.extend(f"• {html.escape(name)} — {time_value}" for name, time_value in parsed_rows)
+        if invalid_rows:
+            result.append("\n⚠️ <b>Не добавлены (проверь формат):</b>")
+            result.extend(f"• Строка {number}: {html.escape(line)}" for number, line in invalid_rows)
+        result.append(f"\nВсего добавлено: {len(parsed_rows)}")
+        await message.answer("\n".join(result), reply_markup=main_menu(), parse_mode="HTML")
+        return
+
     parsed = parse_name_and_time(value)
     if parsed:
         name, time_value = parsed
@@ -272,9 +315,6 @@ async def add_name(message: Message, state: FSMContext):
         )
         return
 
-    if not value:
-        await message.answer("Фамилия не должна быть пустой. Напиши ещё раз:")
-        return
     await state.update_data(name=value)
     await state.set_state(AddPerson.time)
     await message.answer("Теперь укажи время начала работы (например, 07:00):")

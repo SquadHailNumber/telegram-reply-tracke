@@ -1,20 +1,21 @@
 import asyncio
+import html
 import logging
 import os
-from datetime import datetime
-from typing import Optional
+import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "people.db")
+LOCAL_TZ = ZoneInfo("Europe/Moscow")
 
 if not TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN. Добавьте токен в переменные окружения.")
@@ -34,6 +35,42 @@ class EditPerson(StatesGroup):
     time = State()
 
 
+def parse_time(value: str):
+    try:
+        return datetime.strptime(value.strip(), "%H:%M").strftime("%H:%M")
+    except ValueError:
+        return None
+
+
+def parse_name_and_time(value: str):
+    match = re.fullmatch(r"\s*(.+?)\s+(\d{1,2}:\d{2})\s*", value or "")
+    if not match:
+        return None
+    name = match.group(1).strip()
+    time_value = parse_time(match.group(2))
+    if not name or not time_value:
+        return None
+    return name, time_value
+
+
+def worked_duration(start_time: str, finished_at: str):
+    end_dt = datetime.fromisoformat(finished_at)
+    start_clock = datetime.strptime(start_time, "%H:%M").time()
+    start_dt = datetime.combine(end_dt.date(), start_clock)
+    # Если время начала позже времени окончания, смена началась накануне.
+    if start_dt > end_dt:
+        start_dt -= timedelta(days=1)
+    return max(end_dt - start_dt, timedelta(0))
+
+
+def duration_text(duration: timedelta):
+    total_minutes = int(duration.total_seconds() // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if minutes:
+        return f"{hours} ч {minutes} мин"
+    return f"{hours} ч"
+
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -43,9 +80,15 @@ async def init_db():
                 name TEXT NOT NULL,
                 time TEXT NOT NULL,
                 answered INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                finished_at TEXT
             )
         """)
+        # Миграция существующей базы: добавляем время окончания, не удаляя старые записи.
+        cur = await db.execute("PRAGMA table_info(people)")
+        columns = {row[1] for row in await cur.fetchall()}
+        if "finished_at" not in columns:
+            await db.execute("ALTER TABLE people ADD COLUMN finished_at TEXT")
         await db.commit()
 
 
@@ -53,7 +96,7 @@ def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить человека", callback_data="add")],
         [InlineKeyboardButton(text="📋 Все люди", callback_data="list:all")],
-        [InlineKeyboardButton(text="⏳ Кто не ответил", callback_data="list:pending")],
+        [InlineKeyboardButton(text="⏳ Кто ещё работает", callback_data="list:pending")],
         [InlineKeyboardButton(text="🗑 Удалить несколько", callback_data="delete:select")],
     ])
 
@@ -67,10 +110,19 @@ async def get_person(person_id: int, user_id: int):
         return await cur.fetchone()
 
 
+async def insert_person(user_id: int, name: str, time_value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO people(user_id,name,time,answered,created_at,finished_at) VALUES(?,?,?,?,?,NULL)",
+            (user_id, name, time_value, 0, datetime.now(LOCAL_TZ).isoformat())
+        )
+        await db.commit()
+
+
 async def render_list(user_id: int, mode: str):
     condition = ""
     if mode == "pending":
-        condition = " AND answered=0"
+        condition = " AND finished_at IS NULL"
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -80,21 +132,29 @@ async def render_list(user_id: int, mode: str):
         rows = await cur.fetchall()
 
     if not rows:
-        return "Пока записей нет." if mode == "all" else "Нет людей, ожидающих ответа.", None
+        return ("Пока записей нет." if mode == "all" else "Нет людей, которые ещё работают."), None
 
-    answered = sum(row["answered"] for row in rows)
-    text = f"📋 <b>{'Все люди' if mode == 'all' else 'Ожидают ответа'}</b>\n"
+    finished_count = sum(row["finished_at"] is not None for row in rows)
+    title = "Все люди" if mode == "all" else "Ещё работают"
+    text = f"📋 <b>{title}</b>\n"
     if mode == "all":
-        text += f"Ответили: {answered} из {len(rows)}\n\n"
+        text += f"Закончили: {finished_count} из {len(rows)}\n\n"
     else:
-        text += f"Не ответили: {len(rows)}\n\n"
+        text += f"В работе: {len(rows)}\n\n"
 
     buttons = []
     for row in rows:
-        status = "✅" if row["answered"] else "⬜"
-        text += f"{status} <b>{row['name']}</b> — {row['time']}\n"
+        name = html.escape(row["name"])
+        if row["finished_at"]:
+            duration = duration_text(worked_duration(row["time"], row["finished_at"]))
+            status = "🏁"
+            detail = f"{row['time']} · {duration}"
+        else:
+            status = "⏳"
+            detail = f"с {row['time']}"
+        text += f"{status} <b>{name}</b> — {detail}\n"
         buttons.append([InlineKeyboardButton(
-            text=f"{status} {row['name']} · {row['time']}",
+            text=f"{status} {row['name']} · {detail}",
             callback_data=f"person:{row['id']}"
         )])
     buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")])
@@ -110,12 +170,54 @@ async def show_list(target, user_id: int, mode: str):
         await target.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
+def person_keyboard(person):
+    person_id = person["id"]
+    finish_button = (
+        InlineKeyboardButton(text="↩️ Снять отметку окончания", callback_data=f"unfinish:{person_id}")
+        if person["finished_at"] else
+        InlineKeyboardButton(text="🏁 Закончил работу", callback_data=f"finish:{person_id}")
+    )
+    status = "Ответил ✅" if person["answered"] else "Не ответил ⬜"
+    toggle_text = "Снять отметку ответа" if person["answered"] else "Отметить: ответил"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [finish_button],
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"toggle:{person_id}")],
+        [InlineKeyboardButton(text="✏️ Изменить фамилию", callback_data=f"editname:{person_id}")],
+        [InlineKeyboardButton(text="🕒 Изменить время начала", callback_data=f"edittime:{person_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"deleteone:{person_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="list:all")],
+    ])
+
+
+def person_text(person):
+    text = f"<b>{html.escape(person['name'])}</b>\nНачало работы: {person['time']}\n"
+    if person["finished_at"]:
+        end_dt = datetime.fromisoformat(person["finished_at"])
+        duration = duration_text(worked_duration(person["time"], person["finished_at"]))
+        text += f"Окончание: {end_dt.strftime('%H:%M')}\nОтработано: <b>{duration}</b>\n"
+        text += "Статус: 🏁 Закончил работу"
+    else:
+        text += "Окончание: ещё не отмечено\nСтатус: ⏳ Работает"
+    return text
+
+
+async def refresh_person(call: CallbackQuery, person_id: int):
+    person = await get_person(person_id, call.from_user.id)
+    if not person:
+        await call.message.edit_text("Запись не найдена.", reply_markup=main_menu())
+        return
+    await call.message.edit_text(
+        person_text(person), reply_markup=person_keyboard(person), parse_mode="HTML"
+    )
+
+
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Привет! Это бот для учёта ответов.\n\n"
-        "Добавляй людей, указывай время и отмечай, кто ответил.",
+        "Привет! Это бот для учёта рабочего времени.\n\n"
+        "Добавляй людей с временем начала работы, а когда человек закончит — нажимай «Закончил работу».\n"
+        "Бот сам посчитает продолжительность смены.",
         reply_markup=main_menu()
     )
 
@@ -123,7 +225,8 @@ async def start(message: Message, state: FSMContext):
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     await message.answer(
-        "Команды:\n/start — главное меню\n/list — все записи\n/pending — кто не ответил"
+        "Команды:\n/start — главное меню\n/list — все записи\n/pending — кто ещё работает\n\n"
+        "Добавление одной строкой: Иванов 07:00"
     )
 
 
@@ -147,39 +250,47 @@ async def menu_cb(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "add")
 async def add_cb(call: CallbackQuery, state: FSMContext):
     await state.set_state(AddPerson.name)
-    await call.message.edit_text("Напиши имя или фамилию человека:")
+    await call.message.edit_text(
+        "Напиши фамилию и время начала одной строкой, например:\n<b>Иванов 07:00</b>\n\n"
+        "Можно также написать только фамилию — тогда бот отдельно спросит время.",
+        parse_mode="HTML"
+    )
     await call.answer()
 
 
 @dp.message(AddPerson.name)
 async def add_name(message: Message, state: FSMContext):
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer("Имя не должно быть пустым. Напиши ещё раз:")
+    value = (message.text or "").strip()
+    parsed = parse_name_and_time(value)
+    if parsed:
+        name, time_value = parsed
+        await insert_person(message.from_user.id, name, time_value)
+        await state.clear()
+        await message.answer(
+            f"✅ Добавлен: <b>{html.escape(name)}</b>\nНачало работы: {time_value}",
+            reply_markup=main_menu(), parse_mode="HTML"
+        )
         return
-    await state.update_data(name=name)
+
+    if not value:
+        await message.answer("Фамилия не должна быть пустой. Напиши ещё раз:")
+        return
+    await state.update_data(name=value)
     await state.set_state(AddPerson.time)
-    await message.answer("Теперь укажи время (например, 08:30):")
+    await message.answer("Теперь укажи время начала работы (например, 07:00):")
 
 
 @dp.message(AddPerson.time)
 async def add_time(message: Message, state: FSMContext):
-    time_value = (message.text or "").strip()
-    try:
-        datetime.strptime(time_value, "%H:%M")
-    except ValueError:
-        await message.answer("Введи время в формате ЧЧ:ММ, например 08:30:")
+    time_value = parse_time((message.text or "").strip())
+    if not time_value:
+        await message.answer("Введи время в формате ЧЧ:ММ, например 07:00:")
         return
     data = await state.get_data()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO people(user_id,name,time,answered,created_at) VALUES(?,?,?,?,?)",
-            (message.from_user.id, data["name"], time_value, 0, datetime.now().isoformat())
-        )
-        await db.commit()
+    await insert_person(message.from_user.id, data["name"], time_value)
     await state.clear()
     await message.answer(
-        f"✅ Добавлен: <b>{data['name']}</b>, время {time_value}.",
+        f"✅ Добавлен: <b>{html.escape(data['name'])}</b>, начало работы {time_value}.",
         reply_markup=main_menu(), parse_mode="HTML"
     )
 
@@ -197,20 +308,44 @@ async def person_cb(call: CallbackQuery):
     if not person:
         await call.answer("Запись не найдена.", show_alert=True)
         return
-    status = "Ответил ✅" if person["answered"] else "Не ответил ⬜"
-    toggle_text = "Снять отметку" if person["answered"] else "Отметить: ответил"
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=toggle_text, callback_data=f"toggle:{person_id}")],
-        [InlineKeyboardButton(text="✏️ Изменить имя", callback_data=f"editname:{person_id}")],
-        [InlineKeyboardButton(text="🕒 Изменить время", callback_data=f"edittime:{person_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"deleteone:{person_id}")],
-        [InlineKeyboardButton(text="⬅️ К списку", callback_data="list:all")],
-    ])
     await call.message.edit_text(
-        f"<b>{person['name']}</b>\nВремя: {person['time']}\nСтатус: {status}",
-        reply_markup=markup, parse_mode="HTML"
+        person_text(person), reply_markup=person_keyboard(person), parse_mode="HTML"
     )
     await call.answer()
+
+
+@dp.callback_query(F.data.startswith("finish:"))
+async def finish_cb(call: CallbackQuery):
+    person_id = int(call.data.split(":")[1])
+    person = await get_person(person_id, call.from_user.id)
+    if not person:
+        await call.answer("Запись не найдена.", show_alert=True)
+        return
+    if person["finished_at"]:
+        await call.answer("Окончание уже отмечено.", show_alert=True)
+        return
+    finished_at = datetime.now(LOCAL_TZ).replace(tzinfo=None).isoformat(timespec="minutes")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE people SET finished_at=? WHERE id=? AND user_id=? AND finished_at IS NULL",
+            (finished_at, person_id, call.from_user.id)
+        )
+        await db.commit()
+    await call.answer("Время окончания сохранено.")
+    await refresh_person(call, person_id)
+
+
+@dp.callback_query(F.data.startswith("unfinish:"))
+async def unfinish_cb(call: CallbackQuery):
+    person_id = int(call.data.split(":")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE people SET finished_at=NULL WHERE id=? AND user_id=?",
+            (person_id, call.from_user.id)
+        )
+        await db.commit()
+    await call.answer("Отметка окончания снята.")
+    await refresh_person(call, person_id)
 
 
 @dp.callback_query(F.data.startswith("toggle:"))
@@ -228,27 +363,7 @@ async def toggle_cb(call: CallbackQuery):
         )
         await db.commit()
     await call.answer("Статус обновлён.")
-    await person_cb_refresh(call, person_id)
-
-
-async def person_cb_refresh(call: CallbackQuery, person_id: int):
-    person = await get_person(person_id, call.from_user.id)
-    if not person:
-        await call.message.edit_text("Запись не найдена.", reply_markup=main_menu())
-        return
-    status = "Ответил ✅" if person["answered"] else "Не ответил ⬜"
-    toggle_text = "Снять отметку" if person["answered"] else "Отметить: ответил"
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=toggle_text, callback_data=f"toggle:{person_id}")],
-        [InlineKeyboardButton(text="✏️ Изменить имя", callback_data=f"editname:{person_id}")],
-        [InlineKeyboardButton(text="🕒 Изменить время", callback_data=f"edittime:{person_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"deleteone:{person_id}")],
-        [InlineKeyboardButton(text="⬅️ К списку", callback_data="list:all")],
-    ])
-    await call.message.edit_text(
-        f"<b>{person['name']}</b>\nВремя: {person['time']}\nСтатус: {status}",
-        reply_markup=markup, parse_mode="HTML"
-    )
+    await refresh_person(call, person_id)
 
 
 @dp.callback_query(F.data.startswith("editname:"))
@@ -260,7 +375,7 @@ async def edit_name_cb(call: CallbackQuery, state: FSMContext):
         return
     await state.update_data(person_id=person_id)
     await state.set_state(EditPerson.name)
-    await call.message.edit_text(f"Напиши новое имя для записи «{person['name']}»:")
+    await call.message.edit_text(f"Напиши новую фамилию для записи «{html.escape(person['name'])}»:", parse_mode="HTML")
     await call.answer()
 
 
@@ -268,7 +383,7 @@ async def edit_name_cb(call: CallbackQuery, state: FSMContext):
 async def edit_name_message(message: Message, state: FSMContext):
     name = (message.text or "").strip()
     if not name:
-        await message.answer("Имя не должно быть пустым. Попробуй ещё раз:")
+        await message.answer("Фамилия не должна быть пустой. Попробуй ещё раз:")
         return
     data = await state.get_data()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -278,7 +393,7 @@ async def edit_name_message(message: Message, state: FSMContext):
         )
         await db.commit()
     await state.clear()
-    await message.answer("✅ Имя изменено.", reply_markup=main_menu())
+    await message.answer("✅ Фамилия изменена.", reply_markup=main_menu())
 
 
 @dp.callback_query(F.data.startswith("edittime:"))
@@ -290,17 +405,15 @@ async def edit_time_cb(call: CallbackQuery, state: FSMContext):
         return
     await state.update_data(person_id=person_id)
     await state.set_state(EditPerson.time)
-    await call.message.edit_text("Напиши новое время в формате ЧЧ:ММ:")
+    await call.message.edit_text("Напиши новое время начала работы в формате ЧЧ:ММ:")
     await call.answer()
 
 
 @dp.message(EditPerson.time)
 async def edit_time_message(message: Message, state: FSMContext):
-    time_value = (message.text or "").strip()
-    try:
-        datetime.strptime(time_value, "%H:%M")
-    except ValueError:
-        await message.answer("Неверный формат. Введи, например, 09:15:")
+    time_value = parse_time((message.text or "").strip())
+    if not time_value:
+        await message.answer("Неверный формат. Введи, например, 07:00:")
         return
     data = await state.get_data()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -310,7 +423,7 @@ async def edit_time_message(message: Message, state: FSMContext):
         )
         await db.commit()
     await state.clear()
-    await message.answer("✅ Время изменено.", reply_markup=main_menu())
+    await message.answer("✅ Время начала изменено.", reply_markup=main_menu())
 
 
 @dp.callback_query(F.data.startswith("deleteone:"))
@@ -325,8 +438,8 @@ async def delete_one_cb(call: CallbackQuery):
         [InlineKeyboardButton(text="Отмена", callback_data=f"person:{person_id}")],
     ])
     await call.message.edit_text(
-        f"Точно удалить «{person['name']}»? Удаление окончательное.",
-        reply_markup=markup
+        f"Точно удалить «{html.escape(person['name'])}»? Удаление окончательное.",
+        reply_markup=markup, parse_mode="HTML"
     )
     await call.answer()
 
@@ -357,12 +470,9 @@ async def delete_select_cb(call: CallbackQuery, state: FSMContext):
         await call.answer("Список пуст.", show_alert=True)
         return
     await state.update_data(delete_ids=[])
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"⬜ {r['name']} · {r['time']}",
-            callback_data=f"pickdelete:{r['id']}"
-        )] for r in rows
-    ]
+    buttons = [[InlineKeyboardButton(
+        text=f"⬜ {r['name']} · {r['time']}", callback_data=f"pickdelete:{r['id']}"
+    )] for r in rows]
     buttons.append([InlineKeyboardButton(text="🗑 Удалить выбранных", callback_data="delete:confirm")])
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="menu")])
     await call.message.edit_text(
@@ -382,7 +492,6 @@ async def pick_delete_cb(call: CallbackQuery, state: FSMContext):
     else:
         ids.add(person_id)
     await state.update_data(delete_ids=list(ids))
-
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -390,18 +499,13 @@ async def pick_delete_cb(call: CallbackQuery, state: FSMContext):
             (call.from_user.id,)
         )
         rows = await cur.fetchall()
-
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"{'☑️' if r['id'] in ids else '⬜'} {r['name']} · {r['time']}",
-            callback_data=f"pickdelete:{r['id']}"
-        )] for r in rows
-    ]
+    buttons = [[InlineKeyboardButton(
+        text=f"{'☑️' if r['id'] in ids else '⬜'} {r['name']} · {r['time']}",
+        callback_data=f"pickdelete:{r['id']}"
+    )] for r in rows]
     buttons.append([InlineKeyboardButton(text=f"🗑 Удалить выбранных ({len(ids)})", callback_data="delete:confirm")])
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="menu")])
-    await call.message.edit_reply_markup(
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+    await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await call.answer()
 
 

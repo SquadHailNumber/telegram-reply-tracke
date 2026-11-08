@@ -1,640 +1,328 @@
-import asyncio
-import logging
 import os
 import re
+import asyncio
 import secrets
 import string
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "people.db")
-TZ = ZoneInfo("Europe/Moscow")
-
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения.")
+    raise RuntimeError("Не задан BOT_TOKEN в переменных Bothost")
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=TOKEN)
+# Используем уже существующую БД, если она найдена. Ничего не удаляем.
+candidates = [
+    os.getenv("DB_PATH", "").strip(),
+    "/app/data/payroll.db",
+    "/app/payroll.db",
+    "/app/data/people.db",
+    "payroll.db",
+]
+DB = next((p for p in candidates if p and Path(p).is_file()), None)
+if DB is None:
+    DB = os.getenv("DB_PATH", "/app/data/payroll.db")
+Path(DB).parent.mkdir(parents=True, exist_ok=True)
+
 dp = Dispatcher()
+db = None
 
-
-class AddPeople(StatesGroup):
-    lines = State()
-
-
-class EditField(StatesGroup):
-    name = State()
-    start = State()
-    end = State()
-
-
-def now_time():
-    return datetime.now(TZ).strftime("%H:%M")
-
-
-def valid_time(value):
-    value = value.strip().replace(".", ":")
-    for fmt in ("%H:%M", "%H"):
-        try:
-            return datetime.strptime(value, fmt).strftime("%H:%M")
-        except ValueError:
-            pass
-    return None
-
-
-def minutes_between(start, end):
-    s = datetime.strptime(start, "%H:%M")
-    e = datetime.strptime(end, "%H:%M")
-    delta = int((e - s).total_seconds() // 60)
-    if delta < 0:
-        delta += 24 * 60
-    return delta
-
-
-def plural(value, one, few, many):
-    n = value % 100
-    if 11 <= n <= 14:
-        return many
-    n = value % 10
-    if n == 1:
-        return one
-    if 2 <= n <= 4:
-        return few
-    return many
-
-
-def format_duration(minutes):
-    hours, mins = divmod(minutes, 60)
-    parts = []
-    if hours:
-        parts.append(f"{hours} {plural(hours, 'час', 'часа', 'часов')}")
-    if mins:
-        parts.append(f"{mins} {plural(mins, 'минута', 'минуты', 'минут')}")
-    return " ".join(parts) if parts else "0 минут"
-
-
-def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить людей списком", callback_data="add")],
-        [InlineKeyboardButton(text="📋 Все люди", callback_data="list:all")],
-        [InlineKeyboardButton(text="📊 Итог смены", callback_data="summary")],
-        [InlineKeyboardButton(text="⏳ Кто не ответил", callback_data="list:pending")],
-        [InlineKeyboardButton(text="🗑 Удалить несколько", callback_data="delete:select")],
-        [InlineKeyboardButton(text="👥 Совместный доступ", callback_data="invite")],
-    ])
-
+HELP = (
+    "Команды:\n"
+    "/list — список работников\n"
+    "/pending — кто ещё не ответил\n"
+    "/invite — создать код для второго/третьего пользователя\n"
+    "/edit ID | ФИО | начало | конец — изменить запись\n"
+    "/delete ID — удалить запись\n"
+    "/help — помощь\n\n"
+    "Добавляй работников обычным сообщением — по одному или списком:\n"
+    "Кириллов Денис 7:00\n"
+    "Григорьев Иван 7:00\n"
+    "Аллагуров Сергей 8:00\n\n"
+    "Время окончания можно не указывать. Нажми «Закончил работу», когда смена завершится."
+)
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS people (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                time TEXT NOT NULL,
-                answered INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-        """)
-        cur = await db.execute("PRAGMA table_info(people)")
-        columns = {row[1] for row in await cur.fetchall()}
-        if "end_time" not in columns:
-            await db.execute("ALTER TABLE people ADD COLUMN end_time TEXT")
-        if "workspace_id" not in columns:
-            await db.execute("ALTER TABLE people ADD COLUMN workspace_id INTEGER")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS workspaces (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL,
-                invite_code TEXT,
-                invite_created_at TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS workspace_members (
-                user_id INTEGER PRIMARY KEY,
-                workspace_id INTEGER NOT NULL
-            )
-        """)
-        # Миграция: старые записи каждого пользователя остаются в его личном общем пространстве.
-        cur = await db.execute("SELECT DISTINCT user_id FROM people WHERE workspace_id IS NULL")
-        old_users = [r[0] for r in await cur.fetchall()]
-        for uid in old_users:
-            cur = await db.execute("SELECT workspace_id FROM workspace_members WHERE user_id=?", (uid,))
-            member = await cur.fetchone()
-            if member:
-                wid = member[0]
-            else:
-                await db.execute("INSERT INTO workspaces(owner_id) VALUES(?)", (uid,))
-                wid = (await (await db.execute("SELECT last_insert_rowid()")).fetchone())[0]
-                await db.execute("INSERT OR IGNORE INTO workspace_members(user_id,workspace_id) VALUES(?,?)", (uid, wid))
-            await db.execute("UPDATE people SET workspace_id=? WHERE user_id=? AND workspace_id IS NULL", (wid, uid))
-        await db.commit()
-
-
-async def get_workspace_id(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT workspace_id FROM workspace_members WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        if row:
-            return row[0]
-        await db.execute("INSERT INTO workspaces(owner_id) VALUES(?)", (user_id,))
-        cur = await db.execute("SELECT last_insert_rowid()")
-        wid = (await cur.fetchone())[0]
-        await db.execute("INSERT INTO workspace_members(user_id,workspace_id) VALUES(?,?)", (user_id, wid))
-        await db.commit()
-        return wid
-
-
-async def get_person(person_id, workspace_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM people WHERE id=? AND workspace_id=?", (person_id, workspace_id)
+    global db
+    db = await aiosqlite.connect(DB)
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS bot_users(
+            user_id INTEGER PRIMARY KEY,
+            joined_at TEXT NOT NULL
         )
-        return await cur.fetchone()
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS invite_codes(
+            code TEXT PRIMARY KEY,
+            created_by INTEGER NOT NULL,
+            used_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS work_entries(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT,
+            replied INTEGER NOT NULL DEFAULT 0,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    await db.commit()
 
+async def allowed(user_id: int) -> bool:
+    cur = await db.execute("SELECT 1 FROM bot_users WHERE user_id=?", (user_id,))
+    return await cur.fetchone() is not None
 
-async def fetch_people(workspace_id, pending=False):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        sql = "SELECT * FROM people WHERE workspace_id=?"
-        if pending:
-            sql += " AND answered=0"
-        sql += " ORDER BY time, id"
-        cur = await db.execute(sql, (workspace_id,))
-        return await cur.fetchall()
+async def user_count() -> int:
+    cur = await db.execute("SELECT COUNT(*) FROM bot_users")
+    return (await cur.fetchone())[0]
 
+async def require_access(message: Message) -> bool:
+    if await allowed(message.from_user.id):
+        return True
+    await message.answer("У тебя пока нет доступа. Попроси одного из участников прислать код приглашения и отправь его боту.")
+    return False
 
-def person_line(row):
-    status = "✅" if row["answered"] else "⬜"
-    if row["end_time"]:
-        duration = format_duration(minutes_between(row["time"], row["end_time"]))
-        work = f"до {row['end_time']} / {duration}"
+def parse_time(value):
+    value = value.strip().replace(".", ":")
+    m = re.fullmatch(r"([0-2]?\d):([0-5]\d)", value)
+    if not m:
+        return None
+    h, minute = int(m.group(1)), int(m.group(2))
+    if h > 23:
+        return None
+    return f"{h:02d}:{minute:02d}"
+
+def parse_line(line):
+    line = line.strip()
+    if not line:
+        return None
+    m = re.match(r"^(.+?)\s+([0-2]?\d:[0-5]\d)$", line)
+    if not m:
+        return None
+    name = " ".join(m.group(1).split())
+    start = parse_time(m.group(2))
+    if not name or not start:
+        return None
+    return name, start
+
+def duration(start, end):
+    fmt = "%H:%M"
+    a = datetime.strptime(start, fmt)
+    b = datetime.strptime(end, fmt)
+    if b < a:
+        b += timedelta(days=1)
+    mins = int((b-a).total_seconds() // 60)
+    hours, rem = divmod(mins, 60)
+    return f"{hours} ч {rem:02d} мин" if rem else f"{hours} ч"
+
+def entry_keyboard(entry_id, replied, ended):
+    kb = InlineKeyboardBuilder()
+    if not replied:
+        kb.button(text="✅ Ответил", callback_data=f"reply:{entry_id}")
+    if not ended:
+        kb.button(text="🏁 Закончил работу", callback_data=f"end:{entry_id}")
+    kb.adjust(1)
+    return kb.as_markup() if kb.buttons else None
+
+async def render_entry(row):
+    entry_id, name, start, end, replied = row
+    status = "✅ Ответил" if replied else "⏳ Не ответил"
+    if end:
+        worked = duration(start, end)
+        status += f"\n🏁 {start}–{end} / {worked}"
     else:
-        work = "ещё работает"
-    return f"{status} <b>{row['name']}</b> к {row['time']} — {work}"
+        status += f"\n🕒 Начало: {start}"
+    return f"#{entry_id} — {name}\n{status}"
 
-
-def person_keyboard(row):
-    pid = row["id"]
-    toggle = "Снять ✅" if row["answered"] else "Отметить: ответил ✅"
-    finish = "🔄 Изменить окончание" if row["end_time"] else "🏁 Закончил работу сейчас"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=toggle, callback_data=f"toggle:{pid}")],
-        [InlineKeyboardButton(text=finish, callback_data=f"finish:{pid}")],
-        [InlineKeyboardButton(text="✏️ Изменить фамилию", callback_data=f"editname:{pid}")],
-        [InlineKeyboardButton(text="🕒 Изменить время прихода", callback_data=f"editstart:{pid}")],
-        [InlineKeyboardButton(text="🕒 Изменить время окончания", callback_data=f"editend:{pid}")],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"deleteone:{pid}")],
-        [InlineKeyboardButton(text="⬅️ К списку", callback_data="list:all")],
-    ])
-
-
-async def render_list(workspace_id, pending=False):
-    rows = await fetch_people(workspace_id, pending)
-    if not rows:
-        return ("Нет людей, ожидающих ответа." if pending else "Пока записей нет."), None
-    title = "⏳ <b>Кто не ответил</b>" if pending else "📋 <b>Все люди</b>"
-    text = title + "\n\n" + "\n".join(person_line(r) for r in rows)
-    buttons = [[InlineKeyboardButton(
-        text=f"{'✅' if r['answered'] else '⬜'} {r['name']} · {r['time']}",
-        callback_data=f"person:{r['id']}"
-    )] for r in rows]
-    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")])
-    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-async def show_list(target, workspace_id, pending=False):
-    text, markup = await render_list(workspace_id, pending)
-    if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-        await target.answer()
-    else:
-        await target.answer(text, reply_markup=markup, parse_mode="HTML")
-
-
-def parse_people_lines(raw):
-    parsed, errors = [], []
-    for number, line in enumerate(raw.splitlines(), 1):
-        line = line.strip()
-        if not line:
-            continue
-        match = re.match(r"^(.+?)\s+(\d{1,2}(?::|\.?)\d{0,2})$", line)
-        if not match:
-            errors.append(f"Строка {number}: «{line}» — нужен формат Фамилия 07:00")
-            continue
-        name = match.group(1).strip()
-        start = valid_time(match.group(2))
-        if not name or not start:
-            errors.append(f"Строка {number}: «{line}» — проверь фамилию и время")
-            continue
-        parsed.append((name, start))
-    return parsed, errors
-
-
-@dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "Привет! Это бот учёта смен и ответов.\n\n"
-        "Добавляй людей списком, отмечай ответы и окончание работы.\n\n"
-        "Чтобы подключить второго человека, нажми «Совместный доступ» и отправь ему команду-приглашение.",
-        reply_markup=main_menu()
-    )
-
-
-@dp.callback_query(F.data == "invite")
-async def invite_cb(call: CallbackQuery):
-    wid = await get_workspace_id(call.from_user.id)
-    code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM workspace_members WHERE workspace_id=?", (wid,))
-        members_count = (await cur.fetchone())[0]
-        if members_count >= 2:
-            await call.answer("В общем списке уже два пользователя.", show_alert=True)
-            return
-        await db.execute("UPDATE workspaces SET invite_code=?, invite_created_at=? WHERE id=?",
-                         (code, datetime.now(TZ).isoformat(), wid))
-        await db.commit()
-    await call.message.answer(
-        "👥 <b>Приглашение для второго пользователя</b>\n\n"
-        f"Отправь ему эту команду: <code>/join {code}</code>\n\n"
-        "Код одноразовый. После вступления он перестанет действовать. "
-        "Не пересылай его посторонним.", parse_mode="HTML"
-    )
-    await call.answer("Код создан.")
-
-
-@dp.message(Command("join"))
-async def join_cmd(message: Message):
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2:
-        await message.answer("Чтобы присоединиться, отправь команду /join КОД, который дал владелец бота.")
-        return
-    code = parts[1].strip().upper()
+@dp.message(Command("start"))
+async def start_cmd(message: Message):
     uid = message.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, owner_id FROM workspaces WHERE invite_code=?", (code,))
-        workspace = await cur.fetchone()
-        if not workspace:
-            await message.answer("❌ Код не найден или уже использован. Попроси владельца создать новый.")
-            return
-        wid, owner_id = workspace
-        cur = await db.execute("SELECT workspace_id FROM workspace_members WHERE user_id=?", (uid,))
-        existing = await cur.fetchone()
-        if existing and existing[0] != wid:
-            cur = await db.execute("SELECT COUNT(*) FROM people WHERE workspace_id=?", (existing[0],))
-            own_records = (await cur.fetchone())[0]
-            if own_records:
-                await message.answer("❌ У тебя уже есть отдельный список с записями. Сначала свяжись с владельцем, чтобы не потерять свои данные.")
-                return
-            await db.execute("DELETE FROM workspace_members WHERE user_id=?", (uid,))
-        cur = await db.execute("SELECT COUNT(*) FROM workspace_members WHERE workspace_id=?", (wid,))
-        if (await cur.fetchone())[0] >= 2 and (not existing or existing[0] != wid):
-            await message.answer("❌ В этом общем списке уже подключены два пользователя.")
-            return
-        await db.execute("INSERT OR REPLACE INTO workspace_members(user_id,workspace_id) VALUES(?,?)", (uid, wid))
-        await db.execute("UPDATE workspaces SET invite_code=NULL, invite_created_at=NULL WHERE id=?", (wid,))
+    if await allowed(uid):
+        await message.answer("Бот готов к работе.\n\n" + HELP)
+        return
+    count = await user_count()
+    if count == 0:
+        await db.execute("INSERT INTO bot_users(user_id,joined_at) VALUES(?,?)",
+                         (uid, datetime.now().isoformat(timespec="seconds")))
         await db.commit()
-    await message.answer("✅ Готово! Ты подключён к общему списку. Теперь добавления, отметки и изменения будут видны вам обоим.", reply_markup=main_menu())
-
-
-@dp.message(Command("id"))
-async def id_cmd(message: Message):
-    await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
-
+        await message.answer("Ты первый участник и администратор доступа. Теперь можно пригласить ещё двух человек командой /invite.\n\n" + HELP)
+        return
+    await message.answer("Отправь код приглашения, который создал один из участников командой /invite.")
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
-    await message.answer(
-        "Добавление: каждая строка — Фамилия ЧЧ:ММ.\n"
-        "Например:\nКириллов 07:00\nГригорьев 07:00\n\n"
-        "/list — все записи\n/pending — кто не ответил\n"
-        "Совместный доступ: нажми кнопку в меню, отправь второму человеку /join КОД."
-    )
+    if await require_access(message):
+        await message.answer(HELP)
 
+@dp.message(Command("invite"))
+async def invite_cmd(message: Message):
+    if not await require_access(message):
+        return
+    if await user_count() >= 3:
+        await message.answer("Все 3 места уже заняты.")
+        return
+    alphabet = string.ascii_uppercase + string.digits
+    code = "".join(secrets.choice(alphabet) for _ in range(8))
+    await db.execute("INSERT INTO invite_codes(code,created_by,created_at) VALUES(?,?,?)",
+                     (code, message.from_user.id, datetime.now().isoformat(timespec="seconds")))
+    await db.commit()
+    await message.answer(f"Код приглашения: {code}\nПришли его второму или третьему участнику. Код одноразовый.")
+
+@dp.message(F.text)
+async def text_handler(message: Message):
+    text = (message.text or "").strip()
+    if not text:
+        return
+    if not await allowed(message.from_user.id):
+        code = text.upper()
+        cur = await db.execute("SELECT code FROM invite_codes WHERE code=? AND used_by IS NULL", (code,))
+        found = await cur.fetchone()
+        if found and await user_count() < 3:
+            await db.execute("INSERT OR IGNORE INTO bot_users(user_id,joined_at) VALUES(?,?)",
+                             (message.from_user.id, datetime.now().isoformat(timespec="seconds")))
+            await db.execute("UPDATE invite_codes SET used_by=? WHERE code=?",
+                             (message.from_user.id, code))
+            await db.commit()
+            await message.answer("Доступ открыт! Теперь вы видите общий список и можете им управлять.\n\n" + HELP)
+        else:
+            await message.answer("Код не найден, уже использован или все 3 места заняты.")
+        return
+
+    lines = text.splitlines()
+    parsed, bad = [], []
+    for line in lines:
+        item = parse_line(line)
+        if item:
+            parsed.append(item)
+        elif line.strip():
+            bad.append(line.strip())
+
+    if not parsed:
+        if text.startswith("/"):
+            return
+        await message.answer("Не понял формат. Используй: Кириллов Денис 7:00\nМожно отправить сразу несколько строк.")
+        return
+
+    now = datetime.now().isoformat(timespec="seconds")
+    for name, start in parsed:
+        await db.execute(
+            "INSERT INTO work_entries(full_name,start_time,created_by,created_at) VALUES(?,?,?,?)",
+            (name, start, message.from_user.id, now)
+        )
+    await db.commit()
+    answer = f"Добавлено работников: {len(parsed)}."
+    if bad:
+        answer += "\nНе удалось распознать строки:\n" + "\n".join(bad)
+    await message.answer(answer)
+    cur = await db.execute("SELECT id,full_name,start_time,end_time,replied FROM work_entries ORDER BY id DESC LIMIT ?",
+                           (len(parsed),))
+    rows = await cur.fetchall()
+    for row in reversed(rows):
+        await message.answer(await render_entry(row), reply_markup=entry_keyboard(row[0], row[4], row[3] is not None))
 
 @dp.message(Command("list"))
 async def list_cmd(message: Message):
-    await show_list(message, await get_workspace_id(message.from_user.id))
-
+    if not await require_access(message):
+        return
+    cur = await db.execute("SELECT id,full_name,start_time,end_time,replied FROM work_entries ORDER BY id")
+    rows = await cur.fetchall()
+    if not rows:
+        await message.answer("Список пока пуст.")
+        return
+    for row in rows:
+        await message.answer(await render_entry(row), reply_markup=entry_keyboard(row[0], row[4], row[3] is not None))
 
 @dp.message(Command("pending"))
 async def pending_cmd(message: Message):
-    await show_list(message, await get_workspace_id(message.from_user.id), True)
-
-
-@dp.callback_query(F.data == "menu")
-async def menu_cb(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.edit_text("Главное меню:", reply_markup=main_menu())
-    await call.answer()
-
-
-@dp.callback_query(F.data == "add")
-async def add_cb(call: CallbackQuery, state: FSMContext):
-    await state.set_state(AddPeople.lines)
-    await call.message.edit_text(
-        "Отправь список: один человек на каждой строке.\n\n"
-        "Пример:\nКириллов 07:00\nГригорьев 07:00\nАллагуров 08:00\n\n"
-        "Можно отправить сразу несколько строк."
-    )
-    await call.answer()
-
-
-@dp.message(AddPeople.lines)
-async def add_people_message(message: Message, state: FSMContext):
-    parsed, errors = parse_people_lines(message.text or "")
-    if not parsed:
-        await message.answer("Не нашёл корректных строк. Формат: Фамилия 07:00\nПопробуй ещё раз.")
+    if not await require_access(message):
         return
-    wid = await get_workspace_id(message.from_user.id)
-    async with aiosqlite.connect(DB_PATH) as db:
-        for name, start in parsed:
-            await db.execute(
-                "INSERT INTO people(user_id,name,time,answered,created_at,end_time,workspace_id) VALUES(?,?,?,?,?,?,?)",
-                (message.from_user.id, name, start, 0, datetime.now(TZ).isoformat(), wid)
-            )
-        await db.commit()
-    await state.clear()
-    result = f"✅ Добавлено людей: {len(parsed)}\n\n" + "\n".join(
-        f"{name} — к {start}" for name, start in parsed
-    )
-    if errors:
-        result += "\n\n⚠️ Не добавлены:\n" + "\n".join(errors)
-    await message.answer(result, reply_markup=main_menu())
-
-
-@dp.callback_query(F.data.startswith("list:"))
-async def list_cb(call: CallbackQuery):
-    mode = call.data.split(":", 1)[1]
-    await show_list(call, await get_workspace_id(call.from_user.id), mode == "pending")
-
-
-@dp.callback_query(F.data.startswith("person:"))
-async def person_cb(call: CallbackQuery):
-    pid = int(call.data.split(":")[1])
-    row = await get_person(pid, await get_workspace_id(call.from_user.id))
-    if not row:
-        await call.answer("Запись не найдена.", show_alert=True)
-        return
-    status = "Ответил ✅" if row["answered"] else "Не ответил ⬜"
-    end = row["end_time"] or "не указано"
-    duration = format_duration(minutes_between(row["time"], row["end_time"])) if row["end_time"] else "ещё работает"
-    await call.message.edit_text(
-        f"<b>{row['name']}</b>\nПриход: {row['time']}\nОкончание: {end}\n"
-        f"Отработано: {duration}\nСтатус ответа: {status}",
-        reply_markup=person_keyboard(row), parse_mode="HTML"
-    )
-    await call.answer()
-
-
-async def refresh_person(call, pid):
-    row = await get_person(pid, await get_workspace_id(call.from_user.id))
-    if row:
-        status = "Ответил ✅" if row["answered"] else "Не ответил ⬜"
-        end = row["end_time"] or "не указано"
-        duration = format_duration(minutes_between(row["time"], row["end_time"])) if row["end_time"] else "ещё работает"
-        await call.message.edit_text(
-            f"<b>{row['name']}</b>\nПриход: {row['time']}\nОкончание: {end}\n"
-            f"Отработано: {duration}\nСтатус ответа: {status}",
-            reply_markup=person_keyboard(row), parse_mode="HTML"
-        )
-
-
-@dp.callback_query(F.data.startswith("toggle:"))
-async def toggle_cb(call: CallbackQuery):
-    pid = int(call.data.split(":")[1])
-    row = await get_person(pid, await get_workspace_id(call.from_user.id))
-    if not row:
-        await call.answer("Запись не найдена.", show_alert=True)
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE people SET answered=? WHERE id=? AND workspace_id=?",
-                         (0 if row["answered"] else 1, pid, await get_workspace_id(call.from_user.id)))
-        await db.commit()
-    await call.answer("Отметка обновлена.")
-    await refresh_person(call, pid)
-
-
-@dp.callback_query(F.data.startswith("finish:"))
-async def finish_cb(call: CallbackQuery):
-    pid = int(call.data.split(":")[1])
-    row = await get_person(pid, await get_workspace_id(call.from_user.id))
-    if not row:
-        await call.answer("Запись не найдена.", show_alert=True)
-        return
-    end = now_time()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE people SET end_time=? WHERE id=? AND workspace_id=?",
-                         (end, pid, await get_workspace_id(call.from_user.id)))
-        await db.commit()
-    await call.answer(f"Окончание записано: {end}")
-    await refresh_person(call, pid)
-
-
-@dp.callback_query(F.data.startswith("editname:"))
-async def edit_name_cb(call: CallbackQuery, state: FSMContext):
-    pid = int(call.data.split(":")[1])
-    row = await get_person(pid, await get_workspace_id(call.from_user.id))
-    if not row:
-        await call.answer("Запись не найдена.", show_alert=True)
-        return
-    await state.update_data(person_id=pid)
-    await state.set_state(EditField.name)
-    await call.message.edit_text(f"Напиши новое имя вместо «{row['name']}»:")
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("editstart:"))
-async def edit_start_cb(call: CallbackQuery, state: FSMContext):
-    pid = int(call.data.split(":")[1])
-    row = await get_person(pid, await get_workspace_id(call.from_user.id))
-    if not row:
-        await call.answer("Запись не найдена.", show_alert=True)
-        return
-    await state.update_data(person_id=pid)
-    await state.set_state(EditField.start)
-    await call.message.edit_text(f"Укажи новое время прихода. Сейчас: {row['time']}\nФормат: 07:00")
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("editend:"))
-async def edit_end_cb(call: CallbackQuery, state: FSMContext):
-    pid = int(call.data.split(":")[1])
-    row = await get_person(pid, await get_workspace_id(call.from_user.id))
-    if not row:
-        await call.answer("Запись не найдена.", show_alert=True)
-        return
-    await state.update_data(person_id=pid)
-    await state.set_state(EditField.end)
-    await call.message.edit_text(
-        f"Укажи новое время окончания. Сейчас: {row['end_time'] or 'не указано'}\n"
-        "Формат: 15:00"
-    )
-    await call.answer()
-
-
-@dp.message(EditField.name)
-async def edit_name_message(message: Message, state: FSMContext):
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer("Имя не должно быть пустым. Напиши ещё раз:")
-        return
-    data = await state.get_data()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE people SET name=? WHERE id=? AND workspace_id=?",
-                         (name, data["person_id"], await get_workspace_id(message.from_user.id)))
-        await db.commit()
-    await state.clear()
-    await message.answer("✅ Имя изменено.", reply_markup=main_menu())
-
-
-async def save_edited_time(message, state, field):
-    value = valid_time(message.text or "")
-    if not value:
-        await message.answer("Неверный формат. Введи время, например 15:00:")
-        return
-    data = await state.get_data()
-    column = "time" if field == "start" else "end_time"
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(f"UPDATE people SET {column}=? WHERE id=? AND workspace_id=?",
-                         (value, data["person_id"], await get_workspace_id(message.from_user.id)))
-        await db.commit()
-    await state.clear()
-    await message.answer(f"✅ Время {'прихода' if field == 'start' else 'окончания'} изменено на {value}.",
-                         reply_markup=main_menu())
-
-
-@dp.message(EditField.start)
-async def edit_start_message(message: Message, state: FSMContext):
-    await save_edited_time(message, state, "start")
-
-
-@dp.message(EditField.end)
-async def edit_end_message(message: Message, state: FSMContext):
-    await save_edited_time(message, state, "end")
-
-
-@dp.callback_query(F.data == "summary")
-async def summary_cb(call: CallbackQuery):
-    rows = await fetch_people(await get_workspace_id(call.from_user.id))
+    cur = await db.execute("SELECT id,full_name,start_time,end_time,replied FROM work_entries WHERE replied=0 ORDER BY id")
+    rows = await cur.fetchall()
     if not rows:
-        await call.answer("Список пуст.", show_alert=True)
+        await message.answer("Все ответили ✅")
         return
-    lines = []
-    total_minutes = 0
-    finished = 0
     for row in rows:
-        if row["end_time"]:
-            mins = minutes_between(row["time"], row["end_time"])
-            total_minutes += mins
-            finished += 1
-            lines.append(f"<b>{row['name']}</b> к {row['time']} до {row['end_time']} / {format_duration(mins)}")
-        else:
-            lines.append(f"<b>{row['name']}</b> к {row['time']} — ещё работает")
-    text = "📊 <b>Итог смены</b>\n\n" + "\n".join(lines)
-    text += f"\n\nЗавершили: {finished} из {len(rows)}"
-    text += f"\nСуммарно отработано: {format_duration(total_minutes)}"
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить итог", callback_data="summary")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")]
-    ]), parse_mode="HTML")
-    await call.answer()
+        await message.answer(await render_entry(row), reply_markup=entry_keyboard(row[0], row[4], row[3] is not None))
 
-
-@dp.callback_query(F.data.startswith("deleteone:"))
-async def delete_one_cb(call: CallbackQuery):
-    pid = int(call.data.split(":")[1])
-    row = await get_person(pid, await get_workspace_id(call.from_user.id))
-    if not row:
-        await call.answer("Запись не найдена.", show_alert=True)
+@dp.callback_query(F.data.startswith("reply:"))
+async def reply_cb(call: CallbackQuery):
+    if not await allowed(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
         return
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Да, удалить", callback_data=f"confirmdelete:{pid}")],
-        [InlineKeyboardButton(text="Отмена", callback_data=f"person:{pid}")]
-    ])
-    await call.message.edit_text(f"Точно удалить «{row['name']}»? Удаление окончательное.", reply_markup=markup)
-    await call.answer()
+    entry_id = int(call.data.split(":")[1])
+    await db.execute("UPDATE work_entries SET replied=1 WHERE id=?", (entry_id,))
+    await db.commit()
+    await call.answer("Отмечено")
+    cur = await db.execute("SELECT id,full_name,start_time,end_time,replied FROM work_entries WHERE id=?", (entry_id,))
+    row = await cur.fetchone()
+    if row:
+        await call.message.edit_text(await render_entry(row), reply_markup=entry_keyboard(row[0], row[4], row[3] is not None))
 
-
-@dp.callback_query(F.data.startswith("confirmdelete:"))
-async def confirm_delete_cb(call: CallbackQuery):
-    pid = int(call.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM people WHERE id=? AND workspace_id=?", (pid, await get_workspace_id(call.from_user.id)))
-        await db.commit()
-    await call.message.edit_text("🗑 Запись удалена.", reply_markup=main_menu())
-    await call.answer()
-
-
-@dp.callback_query(F.data == "delete:select")
-async def delete_select_cb(call: CallbackQuery, state: FSMContext):
-    rows = await fetch_people(await get_workspace_id(call.from_user.id))
-    if not rows:
-        await call.answer("Список пуст.", show_alert=True)
+@dp.callback_query(F.data.startswith("end:"))
+async def end_cb(call: CallbackQuery):
+    if not await allowed(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
         return
-    await state.update_data(delete_ids=[])
-    buttons = [[InlineKeyboardButton(text=f"⬜ {r['name']} · {r['time']}",
-                                     callback_data=f"pickdelete:{r['id']}")] for r in rows]
-    buttons += [
-        [InlineKeyboardButton(text="🗑 Удалить выбранных", callback_data="delete:confirm")],
-        [InlineKeyboardButton(text="Отмена", callback_data="menu")]
-    ]
-    await call.message.edit_text("Выбери людей для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await call.answer()
+    entry_id = int(call.data.split(":")[1])
+    end = datetime.now().strftime("%H:%M")
+    await db.execute("UPDATE work_entries SET end_time=? WHERE id=? AND end_time IS NULL", (end, entry_id))
+    await db.commit()
+    cur = await db.execute("SELECT id,full_name,start_time,end_time,replied FROM work_entries WHERE id=?", (entry_id,))
+    row = await cur.fetchone()
+    await call.answer("Время окончания сохранено")
+    if row:
+        await call.message.edit_text(await render_entry(row), reply_markup=entry_keyboard(row[0], row[4], row[3] is not None))
 
+@dp.message(Command("edit"))
+async def edit_cmd(message: Message):
+    if not await require_access(message):
+        return
+    raw = message.text.partition(" ")[2].strip()
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) != 4 or not parts[0].isdigit():
+        await message.answer("Формат:\n/edit ID | ФИО | начало | конец\nПример: /edit 12 | Кириллов Денис | 7:00 | 15:00\nЕсли смена не закончена, вместо конца укажи -")
+        return
+    entry_id, name, start, end = int(parts[0]), parts[1], parse_time(parts[2]), (None if parts[3] == "-" else parse_time(parts[3]))
+    if not name or not start or (parts[3] != "-" and not end):
+        await message.answer("Проверь ФИО и время. Формат времени — 7:00.")
+        return
+    await db.execute("UPDATE work_entries SET full_name=?,start_time=?,end_time=? WHERE id=?",
+                     (name, start, end, entry_id))
+    await db.commit()
+    await message.answer("Запись обновлена. Посмотреть список: /list")
 
-@dp.callback_query(F.data.startswith("pickdelete:"))
-async def pick_delete_cb(call: CallbackQuery, state: FSMContext):
-    pid = int(call.data.split(":")[1])
-    data = await state.get_data()
-    ids = set(data.get("delete_ids", []))
-    ids.symmetric_difference_update({pid})
-    await state.update_data(delete_ids=list(ids))
-    rows = await fetch_people(await get_workspace_id(call.from_user.id))
-    buttons = [[InlineKeyboardButton(
-        text=f"{'☑️' if r['id'] in ids else '⬜'} {r['name']} · {r['time']}",
-        callback_data=f"pickdelete:{r['id']}"
-    )] for r in rows]
-    buttons += [
-        [InlineKeyboardButton(text=f"🗑 Удалить выбранных ({len(ids)})", callback_data="delete:confirm")],
-        [InlineKeyboardButton(text="Отмена", callback_data="menu")]
-    ]
-    await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await call.answer()
-
-
-@dp.callback_query(F.data == "delete:confirm")
-async def confirm_multi_delete_cb(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    ids = data.get("delete_ids", [])
+@dp.message(Command("delete"))
+async def delete_cmd(message: Message):
+    if not await require_access(message):
+        return
+    raw = message.text.partition(" ")[2].strip()
+    ids = [int(x) for x in re.findall(r"\d+", raw)]
     if not ids:
-        await call.answer("Сначала выбери хотя бы одного человека.", show_alert=True)
+        await message.answer("Укажи ID: /delete 12\nНесколько: /delete 12 13 14")
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        placeholders = ",".join("?" for _ in ids)
-        await db.execute(f"DELETE FROM people WHERE workspace_id=? AND id IN ({placeholders})",
-                         [await get_workspace_id(call.from_user.id), *ids])
-        await db.commit()
-    await state.clear()
-    await call.message.edit_text(f"🗑 Удалено записей: {len(ids)}.", reply_markup=main_menu())
-    await call.answer()
-
+    await db.executemany("DELETE FROM work_entries WHERE id=?", [(x,) for x in ids])
+    await db.commit()
+    await message.answer("Удаление выполнено.")
 
 async def main():
     await init_db()
-    await dp.start_polling(bot)
-
+    print(f"Database: {DB}")
+    bot = Bot(token=TOKEN)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await db.close()
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

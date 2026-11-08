@@ -1,50 +1,30 @@
-БОТ ДЛЯ УЧЁТА ОТВЕТОВ — ИНСТРУКЦИЯ
+TELEGRAM BOT: SHARED SHIFT LIST
 
-Что умеет:
-- Добавлять человека: имя/фамилия и время (формат ЧЧ:ММ).
-- Отмечать, ответил человек или нет, одной кнопкой.
-- Снимать отметку, если статус изменился.
-- Редактировать имя и время.
-- Удалять одну запись с подтверждением.
-- Выбирать и удалять сразу несколько записей.
-- Показывать всех людей или только тех, кто не ответил.
-- Хранить данные в SQLite между перезапусками.
+Files:
+- bot.py - bot source code
+- requirements.txt - dependencies (aiogram 3.4.0)
+- Procfile - Bothost worker command
+- runtime.txt - Python runtime
 
-ЗАПУСК ЛОКАЛЬНО
-1. Установите Python 3.11 или новее.
-2. Распакуйте архив.
-3. Установите зависимости:
-   pip install -r requirements.txt
-4. Создайте бота через @BotFather в Telegram командой /newbot.
-5. Скопируйте токен бота.
-6. Создайте переменную окружения BOT_TOKEN с этим токеном.
-   Не отправляйте токен посторонним и не публикуйте его.
-7. Запустите:
-   python bot.py
+UPDATE ON BOTHOST WITHOUT DELETING OLD DATA
+1. Do not delete the existing bot or its persistent storage/database.
+2. Replace only bot.py in the existing GitHub repository with this version.
+3. Keep requirements.txt, Procfile and runtime.txt as they are.
+4. In Bothost, use the existing project and existing persistent storage. Click update/redeploy from Git.
+5. Do not change DB_PATH. Existing records are migrated automatically and retained.
 
-КРУГЛОСУТОЧНАЯ РАБОТА
-Для постоянной работы нужен сервер/облачный хостинг, который поддерживает
-долгоживущий Python worker и постоянный диск/volume.
-Загрузите файлы проекта в GitHub или в выбранный хостинг.
-Укажите команду запуска: python bot.py
-Добавьте секрет BOT_TOKEN.
-Подключите постоянный диск и задайте DB_PATH на нём, например:
-   /data/people.db
+CONNECT THE SECOND PERSON
+1. Open the bot from your own Telegram account and press Start.
+2. Open the bot menu and tap "Совместный доступ".
+3. The bot will show a one-time command such as /join A1B2C3D4.
+4. Send that command privately to the second person.
+5. The second person opens the same bot, presses Start, then sends /join CODE.
+6. The bot confirms that the shared list is connected. Both users now have the same permissions and see the same list.
 
-ВАЖНО ПРО ХРАНЕНИЕ
-SQLite сохраняет записи при обычных перезапусках, если файл people.db
-находится на постоянном диске. На временной файловой системе хостинга
-данные могут пропасть при пересоздании/перезапуске сервиса.
-Не запускайте одновременно две копии этого бота с одной базой.
-
-КАК ПОЛЬЗОВАТЬСЯ
-/start — открыть меню.
-«Добавить человека» — ввести имя, затем время.
-«Все люди» — открыть общий список.
-Нажать на человека — открыть карточку, где можно отметить ответ,
-изменить имя/время или удалить запись.
-«Удалить несколько» — выбрать нужные записи и подтвердить удаление.
-
-Безопасность:
-- Бот показывает и изменяет только записи пользователя, который их создал.
-- Удаление окончательное, отдельной корзины нет.
+IMPORTANT
+- Invite code is one-time. If it is used by the wrong person, create a new one.
+- The shared workspace supports up to two Telegram accounts.
+- Do not publish or forward the invite code to anyone else.
+- Existing records are assigned to the Telegram account that owned them before migration.
+- The second person should use /join CODE before trying list/add commands.
+- Keep BOT_TOKEN and DB_PATH settings in Bothost unchanged.
